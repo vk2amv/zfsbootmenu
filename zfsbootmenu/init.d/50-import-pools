@@ -105,7 +105,59 @@ if [ "${unsupported}" -ne 0 ]; then
 fi
 unset unsupported
 
-if [ -n "${zbm_prefer_bootfs}" ]; then
+# --- discover one-shot BOOTFS override from pool property ---
+for P in $(zpool list -H -o name 2>/dev/null); do
+  VAL="$(zpool get -H -o value org.zbm:bootonce "$P" 2>/dev/null | head -n1 || printf '')"
+  # trim trailing whitespace / CR just in case
+  VAL="$(printf '%s' "$VAL" | tr -d '\r' | sed 's/[[:space:]]*$//')"
+
+  # skip unset/empty/"-"
+  [ -n "${VAL}" ] && [ "${VAL}" != "-" ] || continue
+
+  # must be a valid ZFS filesystem dataset
+  if is_zfs_filesystem "$VAL"; then
+    BOOTFS_OVERRIDE="$VAL"
+
+  # Clear the bootonce flag now so failure auto-falls back next boot
+  # pool may be RO in ZBM; temporarily flip to RW, clear flag, flip back
+  _ro_state="$(zpool get -H -o value readonly "$P" 2>/dev/null || echo on)"
+  _did_flip=0
+  if [ "$_ro_state" = "on" ]; then
+    zpool export "$P" 2>/dev/null || true
+    zpool import -N -o readonly=off "$P"
+    _did_flip=1
+  fi
+
+  # clear the one-shot flag safely
+  zpool set org.zbm:bootonce="" "$P" 2>/dev/null ||
+
+  if [ "$_did_flip" -eq 1 ]; then
+    zpool export "$P" 2>/dev/null || true
+    zpool import -N -o readonly=on "$P"
+  fi
+
+    echo "Valid bootonce target found $VAL on pool ${P}"
+    export BOOTFS_OVERRIDE
+    echo "${BOOTFS_OVERRIDE}" > "${BASE}/bootfs_override"
+    sleep 5
+    break
+  else
+    zwarn "ignoring invalid org.zbm:bootonce='${VAL}' on pool ${P}"
+    echo "Ignoring invalid bootonce target found '$VAL' on pool ${P}" >&2
+    sleep 5
+  fi
+done
+# --- end one-shot discovery ---
+
+
+# If override exists, honor it and skip discovery
+if [ -n "${BOOTFS_OVERRIDE:-}" ]; then
+  if is_zfs_filesystem "${BOOTFS_OVERRIDE}" ; then
+    BOOTFS="${BOOTFS_OVERRIDE}"
+  else
+    zwarn "override bootfs '${BOOTFS_OVERRIDE}' not a ZFS dataset; ignoring"
+  fi
+elif [ -n "${zbm_prefer_bootfs}" ]; then
   if is_zfs_filesystem "${zbm_prefer_bootfs}" ; then
     BOOTFS="${zbm_prefer_bootfs}"
   else
@@ -125,7 +177,9 @@ else
   unset _bootfs
 fi
 
+
 if [ -n "${BOOTFS}" ]; then
   export BOOTFS
   echo "${BOOTFS}" > "${BASE}/bootfs"
 fi
+
